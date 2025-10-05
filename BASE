@@ -1,0 +1,324 @@
+# main.py
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Optional, List
+
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from sqlalchemy import (create_engine, Column, Integer, String, DateTime, Float,
+                        ForeignKey, Boolean, Text)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
+import bcrypt
+import jwt
+
+# =========================
+# CONFIG
+# =========================
+DATABASE_URL = "sqlite:///./ponto.db"
+JWT_SECRET = "mude-este-segredo-super-seguro"   # troque em produção!
+JWT_ALGO = "HS256"
+TOKEN_EXPIRE_MINUTES = 8 * 60  # 8h
+TZ = ZoneInfo("America/Sao_Paulo")
+
+# =========================
+# DB
+# =========================
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+
+class Employee(Base):
+    __tablename__ = "employees"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(120), unique=True, index=True, nullable=False)
+    pin_hash = Column(String(200), nullable=False)
+    is_admin = Column(Boolean, default=False)
+    role = Column(String(120), default="")
+
+    events = relationship("TimeEvent", back_populates="employee")
+
+
+class TimeEvent(Base):
+    __tablename__ = "time_events"
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False)
+    type = Column(String(10), nullable=False)  # "IN" ou "OUT"
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(tz=TZ))
+    device = Column(String(120), default="")
+    notes = Column(Text, default="")
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+
+    employee = relationship("Employee", back_populates="events")
+
+
+def create_db_and_admin():
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        # cria admin padrão se não existir
+        admin = db.query(Employee).filter(Employee.is_admin == True).first()
+        if not admin:
+            pin = "1234"  # TROQUE!
+            hashed = bcrypt.hashpw(pin.encode(), bcrypt.gensalt()).decode()
+            admin = Employee(name="admin", pin_hash=hashed, is_admin=True, role="Administrador")
+            db.add(admin)
+            db.commit()
+            print(">>> Admin criado: usuário=admin, PIN=1234 (troque!)")
+    finally:
+        db.close()
+
+
+create_db_and_admin()
+
+# =========================
+# Schemas
+# =========================
+class EmployeeCreate(BaseModel):
+    name: str
+    pin: str
+    is_admin: bool = False
+    role: str = ""
+
+
+class EmployeeOut(BaseModel):
+    id: int
+    name: str
+    is_admin: bool
+    role: str
+
+    class Config:
+        from_attributes = True
+
+
+class ClockInOut(BaseModel):
+    type: str  # "IN" ou "OUT"
+    device: Optional[str] = ""
+    notes: Optional[str] = ""
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+class EventOut(BaseModel):
+    id: int
+    employee_id: int
+    employee_name: str
+    type: str
+    timestamp_iso: str
+    device: str
+    notes: str
+    lat: Optional[float]
+    lng: Optional[float]
+
+    class Config:
+        from_attributes = True
+
+
+# =========================
+# Auth
+# =========================
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def create_access_token(data: dict, expires_minutes: int = TOKEN_EXPIRE_MINUTES):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Employee:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        user_id: int = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Token inválido")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Não autenticado")
+
+    user = db.get(Employee, user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuário não encontrado")
+    return user
+
+
+def require_admin(user: Employee):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Apenas administradores")
+
+
+# =========================
+# App
+# =========================
+app = FastAPI(title="Registro de Ponto", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # ajuste em produção
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- LOGIN (por PIN) ----
+@app.post("/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    username pode ser o nome do colaborador OU o ID numérico (string).
+    password = PIN.
+    """
+    # tentar por ID
+    employee = None
+    if form_data.username.isdigit():
+        employee = db.get(Employee, int(form_data.username))
+
+    if employee is None:
+        employee = db.query(Employee).filter(Employee.name == form_data.username).first()
+
+    if not employee:
+        raise HTTPException(status_code=400, detail="Usuário não encontrado")
+
+    if not bcrypt.checkpw(form_data.password.encode(), employee.pin_hash.encode()):
+        raise HTTPException(status_code=400, detail="PIN incorreto")
+
+    token = create_access_token({"sub": employee.id, "name": employee.name, "is_admin": employee.is_admin})
+    return {"access_token": token, "token_type": "bearer", "user": {"id": employee.id, "name": employee.name, "is_admin": employee.is_admin}}
+
+# ---- COLABORADOR: Bater ponto ----
+@app.post("/clock", response_model=EventOut)
+def clock(body: ClockInOut, user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+    t = body.type.upper().strip()
+    if t not in ("IN", "OUT"):
+        raise HTTPException(status_code=400, detail="type deve ser IN ou OUT")
+
+    ev = TimeEvent(
+        employee_id=user.id,
+        type=t,
+        timestamp=datetime.now(tz=TZ),
+        device=body.device or "",
+        notes=body.notes or "",
+        lat=body.lat,
+        lng=body.lng
+    )
+    db.add(ev)
+    db.commit()
+    db.refresh(ev)
+
+    return EventOut(
+        id=ev.id,
+        employee_id=user.id,
+        employee_name=user.name,
+        type=ev.type,
+        timestamp_iso=ev.timestamp.astimezone(TZ).isoformat(),
+        device=ev.device,
+        notes=ev.notes,
+        lat=ev.lat,
+        lng=ev.lng
+    )
+
+# ---- COLABORADOR: Meus eventos ----
+@app.get("/me/events", response_model=List[EventOut])
+def my_events(user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+    evs = (
+        db.query(TimeEvent)
+        .filter(TimeEvent.employee_id == user.id)
+        .order_by(TimeEvent.timestamp.desc())
+        .limit(100)
+        .all()
+    )
+    out: List[EventOut] = []
+    for e in evs:
+        out.append(EventOut(
+            id=e.id,
+            employee_id=user.id,
+            employee_name=user.name,
+            type=e.type,
+            timestamp_iso=e.timestamp.astimezone(TZ).isoformat(),
+            device=e.device,
+            notes=e.notes,
+            lat=e.lat,
+            lng=e.lng
+        ))
+    return out
+
+# ---- ADMIN: criar colaborador ----
+@app.post("/admin/employees", response_model=EmployeeOut)
+def create_employee(emp: EmployeeCreate, user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    if db.query(Employee).filter(Employee.name == emp.name).first():
+        raise HTTPException(status_code=400, detail="Nome já cadastrado")
+
+    hashed = bcrypt.hashpw(emp.pin.encode(), bcrypt.gensalt()).decode()
+    e = Employee(name=emp.name, pin_hash=hashed, is_admin=emp.is_admin, role=emp.role)
+    db.add(e)
+    db.commit()
+    db.refresh(e)
+    return e
+
+# ---- ADMIN: listar colaboradores ----
+@app.get("/admin/employees", response_model=List[EmployeeOut])
+def list_employees(user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    emps = db.query(Employee).order_by(Employee.name.asc()).all()
+    return [EmployeeOut.model_validate(e) for e in emps]
+
+# ---- ADMIN: eventos (filtro opcional) ----
+@app.get("/admin/events", response_model=List[EventOut])
+def list_events(
+    user: Employee = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    employee_id: Optional[int] = None,
+    date_from: Optional[str] = None,  # "2025-10-01"
+    date_to: Optional[str] = None     # "2025-10-05"
+):
+    require_admin(user)
+    q = db.query(TimeEvent).join(Employee)
+
+    if employee_id:
+        q = q.filter(TimeEvent.employee_id == employee_id)
+
+    # filtros de data no fuso correto
+    if date_from:
+        try:
+            dt_from = datetime.fromisoformat(date_from).replace(tzinfo=TZ)
+            q = q.filter(TimeEvent.timestamp >= dt_from)
+        except Exception:
+            raise HTTPException(status_code=400, detail="date_from inválido. Use YYYY-MM-DD")
+
+    if date_to:
+        try:
+            dt_to = datetime.fromisoformat(date_to).replace(tzinfo=TZ) + timedelta(days=1)
+            q = q.filter(TimeEvent.timestamp < dt_to)
+        except Exception:
+            raise HTTPException(status_code=400, detail="date_to inválido. Use YYYY-MM-DD")
+
+    q = q.order_by(TimeEvent.timestamp.desc()).limit(1000)
+    rows = q.all()
+
+    out: List[EventOut] = []
+    for e in rows:
+        out.append(EventOut(
+            id=e.id,
+            employee_id=e.employee_id,
+            employee_name=e.employee.name,
+            type=e.type,
+            timestamp_iso=e.timestamp.astimezone(TZ).isoformat(),
+            device=e.device,
+            notes=e.notes,
+            lat=e.lat,
+            lng=e.lng
+        ))
+    return out
