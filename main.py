@@ -1,17 +1,26 @@
-# main.py
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from sqlalchemy import (create_engine, Column, Integer, String, DateTime, Float,
-                        ForeignKey, Boolean, Text)
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    Float,
+    ForeignKey,
+    Boolean,
+    Text,
+)
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 import bcrypt
 import jwt
+
 
 # =========================
 # CONFIG
@@ -21,6 +30,7 @@ JWT_SECRET = "mude-este-segredo-super-seguro"   # troque em produção!
 JWT_ALGO = "HS256"
 TOKEN_EXPIRE_MINUTES = 8 * 60  # 8h
 TZ = ZoneInfo("America/Sao_Paulo")
+
 
 # =========================
 # DB
@@ -59,20 +69,22 @@ def create_db_and_admin():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        # cria admin padrão se não existir
         admin = db.query(Employee).filter(Employee.is_admin == True).first()
         if not admin:
             pin = "1234"  # TROQUE!
             hashed = bcrypt.hashpw(pin.encode(), bcrypt.gensalt()).decode()
-            admin = Employee(name="admin", pin_hash=hashed, is_admin=True, role="Administrador")
+            admin = Employee(
+                name="admin",
+                pin_hash=hashed,
+                is_admin=True,
+                role="Administrador",
+            )
             db.add(admin)
             db.commit()
             print(">>> Admin criado: usuário=admin, PIN=1234 (troque!)")
     finally:
         db.close()
 
-
-create_db_and_admin()
 
 # =========================
 # Schemas
@@ -138,7 +150,9 @@ def create_access_token(data: dict, expires_minutes: int = TOKEN_EXPIRE_MINUTES)
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGO)
 
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Employee:
+def get_current_user(
+    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+) -> Employee:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
         user_id: int = payload.get("sub")
@@ -165,6 +179,12 @@ def require_admin(user: Employee):
 # =========================
 app = FastAPI(title="Registro de Ponto", version="0.1.0")
 
+
+@app.on_event("startup")
+def _startup():
+    """Garante que o banco existe e há um administrador para o primeiro acesso."""
+    create_db_and_admin()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # ajuste em produção
@@ -173,9 +193,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ---- LOGIN (por PIN) ----
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
     """
     username pode ser o nome do colaborador OU o ID numérico (string).
     password = PIN.
@@ -186,7 +210,9 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         employee = db.get(Employee, int(form_data.username))
 
     if employee is None:
-        employee = db.query(Employee).filter(Employee.name == form_data.username).first()
+        employee = (
+            db.query(Employee).filter(Employee.name == form_data.username).first()
+        )
 
     if not employee:
         raise HTTPException(status_code=400, detail="Usuário não encontrado")
@@ -194,12 +220,27 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     if not bcrypt.checkpw(form_data.password.encode(), employee.pin_hash.encode()):
         raise HTTPException(status_code=400, detail="PIN incorreto")
 
-    token = create_access_token({"sub": employee.id, "name": employee.name, "is_admin": employee.is_admin})
-    return {"access_token": token, "token_type": "bearer", "user": {"id": employee.id, "name": employee.name, "is_admin": employee.is_admin}}
+    token = create_access_token(
+        {"sub": employee.id, "name": employee.name, "is_admin": employee.is_admin}
+    )
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": employee.id,
+            "name": employee.name,
+            "is_admin": employee.is_admin,
+        },
+    }
+
 
 # ---- COLABORADOR: Bater ponto ----
 @app.post("/clock", response_model=EventOut)
-def clock(body: ClockInOut, user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+def clock(
+    body: ClockInOut,
+    user: Employee = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     t = body.type.upper().strip()
     if t not in ("IN", "OUT"):
         raise HTTPException(status_code=400, detail="type deve ser IN ou OUT")
@@ -211,7 +252,7 @@ def clock(body: ClockInOut, user: Employee = Depends(get_current_user), db: Sess
         device=body.device or "",
         notes=body.notes or "",
         lat=body.lat,
-        lng=body.lng
+        lng=body.lng,
     )
     db.add(ev)
     db.commit()
@@ -226,12 +267,16 @@ def clock(body: ClockInOut, user: Employee = Depends(get_current_user), db: Sess
         device=ev.device,
         notes=ev.notes,
         lat=ev.lat,
-        lng=ev.lng
+        lng=ev.lng,
     )
+
 
 # ---- COLABORADOR: Meus eventos ----
 @app.get("/me/events", response_model=List[EventOut])
-def my_events(user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+def my_events(
+    user: Employee = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     evs = (
         db.query(TimeEvent)
         .filter(TimeEvent.employee_id == user.id)
@@ -241,22 +286,29 @@ def my_events(user: Employee = Depends(get_current_user), db: Session = Depends(
     )
     out: List[EventOut] = []
     for e in evs:
-        out.append(EventOut(
-            id=e.id,
-            employee_id=user.id,
-            employee_name=user.name,
-            type=e.type,
-            timestamp_iso=e.timestamp.astimezone(TZ).isoformat(),
-            device=e.device,
-            notes=e.notes,
-            lat=e.lat,
-            lng=e.lng
-        ))
+        out.append(
+            EventOut(
+                id=e.id,
+                employee_id=user.id,
+                employee_name=user.name,
+                type=e.type,
+                timestamp_iso=e.timestamp.astimezone(TZ).isoformat(),
+                device=e.device,
+                notes=e.notes,
+                lat=e.lat,
+                lng=e.lng,
+            )
+        )
     return out
+
 
 # ---- ADMIN: criar colaborador ----
 @app.post("/admin/employees", response_model=EmployeeOut)
-def create_employee(emp: EmployeeCreate, user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+def create_employee(
+    emp: EmployeeCreate,
+    user: Employee = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     require_admin(user)
     if db.query(Employee).filter(Employee.name == emp.name).first():
         raise HTTPException(status_code=400, detail="Nome já cadastrado")
@@ -268,12 +320,17 @@ def create_employee(emp: EmployeeCreate, user: Employee = Depends(get_current_us
     db.refresh(e)
     return e
 
+
 # ---- ADMIN: listar colaboradores ----
 @app.get("/admin/employees", response_model=List[EmployeeOut])
-def list_employees(user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_employees(
+    user: Employee = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     require_admin(user)
     emps = db.query(Employee).order_by(Employee.name.asc()).all()
     return [EmployeeOut.model_validate(e) for e in emps]
+
 
 # ---- ADMIN: eventos (filtro opcional) ----
 @app.get("/admin/events", response_model=List[EventOut])
@@ -282,7 +339,7 @@ def list_events(
     db: Session = Depends(get_db),
     employee_id: Optional[int] = None,
     date_from: Optional[str] = None,  # "2025-10-01"
-    date_to: Optional[str] = None     # "2025-10-05"
+    date_to: Optional[str] = None,  # "2025-10-05"
 ):
     require_admin(user)
     q = db.query(TimeEvent).join(Employee)
@@ -296,11 +353,15 @@ def list_events(
             dt_from = datetime.fromisoformat(date_from).replace(tzinfo=TZ)
             q = q.filter(TimeEvent.timestamp >= dt_from)
         except Exception:
-            raise HTTPException(status_code=400, detail="date_from inválido. Use YYYY-MM-DD")
+            raise HTTPException(
+                status_code=400, detail="date_from inválido. Use YYYY-MM-DD"
+            )
 
     if date_to:
         try:
-            dt_to = datetime.fromisoformat(date_to).replace(tzinfo=TZ) + timedelta(days=1)
+            dt_to = datetime.fromisoformat(date_to).replace(tzinfo=TZ) + timedelta(
+                days=1
+            )
             q = q.filter(TimeEvent.timestamp < dt_to)
         except Exception:
             raise HTTPException(status_code=400, detail="date_to inválido. Use YYYY-MM-DD")
@@ -310,15 +371,41 @@ def list_events(
 
     out: List[EventOut] = []
     for e in rows:
-        out.append(EventOut(
-            id=e.id,
-            employee_id=e.employee_id,
-            employee_name=e.employee.name,
-            type=e.type,
-            timestamp_iso=e.timestamp.astimezone(TZ).isoformat(),
-            device=e.device,
-            notes=e.notes,
-            lat=e.lat,
-            lng=e.lng
-        ))
+        out.append(
+            EventOut(
+                id=e.id,
+                employee_id=e.employee_id,
+                employee_name=e.employee.name,
+                type=e.type,
+                timestamp_iso=e.timestamp.astimezone(TZ).isoformat(),
+                device=e.device,
+                notes=e.notes,
+                lat=e.lat,
+                lng=e.lng,
+            )
+        )
     return out
+
+
+@app.get("/", tags=["status"])
+def index():
+    """Rota simples para orientar quem acessa a API sem documentação."""
+    return {
+        "status": "ok",
+        "docs": "/docs",
+        "message": (
+            "Use /login para autenticar-se, /clock para bater ponto e as rotas "
+            "/admin/* para operações administrativas. Veja README para detalhes."
+        ),
+    }
+
+
+@app.get("/health")
+def healthcheck():
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
